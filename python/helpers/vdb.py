@@ -5,6 +5,7 @@ from langchain_core.embeddings import Embeddings
 from langchain_chroma import Chroma
 import chromadb
 from chromadb.config import Settings
+from chromadb.db import Collection # type: ignore
 
 from . import files
 from langchain_core.documents import Document
