@@ -17,7 +17,7 @@ class DirtyJson:
     def parse(self, json_string):
         self._reset()
         self.json_string = json_string
-        self.index = self.index_of_first_brace(self.json_string) #skip any text up to the first brace
+        self.index = self.get_start_pos(self.json_string) #skip any text up to the first brace
         self.current_char = self.json_string[self.index]
         self._parse()
         return self.result
@@ -37,7 +37,28 @@ class DirtyJson:
             self.current_char = None
 
     def _skip_whitespace(self):
-        while self.current_char is not None and self.current_char.isspace():
+        while self.current_char is not None:
+            if self.current_char.isspace():
+                self._advance()
+            elif self.current_char == '/' and self._peek(1) == '/':  # Single-line comment
+                self._skip_single_line_comment()
+            elif self.current_char == '/' and self._peek(1) == '*':  # Multi-line comment
+                self._skip_multi_line_comment()
+            else:
+                break
+
+    def _skip_single_line_comment(self):
+        while self.current_char is not None and self.current_char != '\n':
+            self._advance()
+        if self.current_char == '\n':
+            self._advance()
+
+    def _skip_multi_line_comment(self):
+        self._advance(2)  # Skip /*
+        while self.current_char is not None:
+            if self.current_char == '*' and self._peek(1) == '/':
+                self._advance(2)  # Skip */
+                break
             self._advance()
 
     def _parse(self):
@@ -180,13 +201,20 @@ class DirtyJson:
                 if self.current_char in ['"', "'", '\\', '/', 'b', 'f', 'n', 'r', 't']:
                     result += {'b': '\b', 'f': '\f', 'n': '\n', 'r': '\r', 't': '\t'}.get(self.current_char, self.current_char)
                 elif self.current_char == 'u':
+                    self._advance()  # Skip 'u'
                     unicode_char = ""
+                    # Try to collect exactly 4 hex digits
                     for _ in range(4):
-                        if self.current_char is None:
-                            return result
+                        if self.current_char is None or not self.current_char.isalnum():
+                            # If we can't get 4 hex digits, treat it as a literal '\u' followed by whatever we got
+                            return result + '\\u' + unicode_char
                         unicode_char += self.current_char
                         self._advance()
-                    result += chr(int(unicode_char, 16))
+                    try:
+                        result += chr(int(unicode_char, 16))
+                    except ValueError:
+                        # If invalid hex value, treat as literal
+                        result += '\\u' + unicode_char
                     continue
             else:
                 result += self.current_char
@@ -250,7 +278,7 @@ class DirtyJson:
         return result.strip()
 
     def _peek(self, n):
-        peek_index = self.index
+        peek_index = self.index + 1
         result = ''
         for _ in range(n):
             if peek_index < len(self.json_string):
@@ -260,5 +288,7 @@ class DirtyJson:
                 break
         return result
 
-    def index_of_first_brace(self, input_str: str) -> int:
-        return input_str.find("{")
+    def get_start_pos(self, input_str: str) -> int:
+        chars = ["{", "[", '"']
+        indices = [input_str.find(char) for char in chars if input_str.find(char) != -1]
+        return min(indices) if indices else 0

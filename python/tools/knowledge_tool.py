@@ -1,44 +1,89 @@
 import os
-from agent import Agent
-from . import online_knowledge_tool
-from python.helpers import perplexity_search
-from python.helpers import duckduckgo_search
-
-from . import memory_tool
-import concurrent.futures
-
+import asyncio
+from python.helpers import dotenv, memory, perplexity_search, duckduckgo_search
 from python.helpers.tool import Tool, Response
-from python.helpers import files
 from python.helpers.print_style import PrintStyle
+from python.helpers.errors import handle_error
+from python.helpers.searxng import search as searxng
 
+SEARCH_ENGINE_RESULTS = 10
 class Knowledge(Tool):
-    def execute(self, question="", **kwargs):
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            # Schedule the two functions to be run in parallel
+    async def execute(self, question="", **kwargs):
+        # Create tasks for all three search methods
+        tasks = [
+            self.searxng_search(question),
+            # self.perplexity_search(question),
+            # self.duckduckgo_search(question),
+            self.mem_search(question),
+        ]
 
-            # perplexity search, if API provided
-            if os.getenv("API_KEY_PERPLEXITY"):
-                perplexity = executor.submit(perplexity_search.perplexity_search, question)
-            else: 
-                PrintStyle.hint("No API key provided for Perplexity. Skipping Perplexity search.")
-                perplexity = None
-                
+        # Run all tasks concurrently
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-            # duckduckgo search
-            duckduckgo = executor.submit(duckduckgo_search.search, question)
+        # perplexity_result, duckduckgo_result, memory_result = results
+        searxng_result, memory_result = results
 
-            # memory search
-            future_memory = executor.submit(memory_tool.search, self.agent, question)
+        # Handle exceptions and format results
+        # perplexity_result = self.format_result(perplexity_result, "Perplexity")
+        # duckduckgo_result = self.format_result(duckduckgo_result, "DuckDuckGo")
+        searxng_result = self.format_result_searxng(searxng_result, "Search Engine")
+        memory_result = self.format_result(memory_result, "Memory")
 
-            # Wait for both functions to complete
-            perplexity_result = (perplexity.result() if perplexity else "") or ""
-            duckduckgo_result = duckduckgo.result()
-            memory_result = future_memory.result()
+        msg = self.agent.read_prompt(
+            "tool.knowledge.response.md",
+            #   online_sources = ((perplexity_result + "\n\n") if perplexity_result else "") + str(duckduckgo_result),
+            online_sources=((searxng_result + "\n\n") if searxng_result else ""),
+            memory=memory_result,
+        )
 
-        msg = files.read_file("prompts/tool.knowledge.response.md", 
-                              online_sources = perplexity_result + "\n\n" + str(duckduckgo_result),
-                              memory = memory_result )
-
-        if self.agent.handle_intervention(msg): pass # wait for intervention and handle it, if paused
+        await self.agent.handle_intervention(
+            msg
+        )  # wait for intervention and handle it, if paused
 
         return Response(message=msg, break_loop=False)
+
+    async def perplexity_search(self, question):
+        if dotenv.get_dotenv_value("API_KEY_PERPLEXITY"):
+            return await asyncio.to_thread(
+                perplexity_search.perplexity_search, question
+            )
+        else:
+            PrintStyle.hint(
+                "No API key provided for Perplexity. Skipping Perplexity search."
+            )
+            self.agent.context.log.log(
+                type="hint",
+                content="No API key provided for Perplexity. Skipping Perplexity search.",
+            )
+            return None
+
+    async def duckduckgo_search(self, question):
+        return await asyncio.to_thread(duckduckgo_search.search, question)
+
+    async def searxng_search(self, question):
+        return await searxng(question)
+
+    async def mem_search(self, question: str):
+        db = await memory.Memory.get(self.agent)
+        docs = await db.search_similarity_threshold(
+            query=question, limit=5, threshold=0.5
+        )
+        text = memory.Memory.format_docs_plain(docs)
+        return "\n\n".join(text)
+
+    def format_result(self, result, source):
+        if isinstance(result, Exception):
+            handle_error(result)
+            return f"{source} search failed: {str(result)}"
+        return result if result else ""
+
+    def format_result_searxng(self, result, source):
+        if isinstance(result, Exception):
+            handle_error(result)
+            return f"{source} search failed: {str(result)}"
+
+        outputs = []
+        for item in result["results"]:
+            outputs.append(f"{item['title']}\n{item['url']}\n{item['content']}")
+
+        return "\n\n".join(outputs[:SEARCH_ENGINE_RESULTS]).strip()

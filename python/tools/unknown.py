@@ -1,11 +1,15 @@
 from python.helpers.tool import Tool, Response
-from python.helpers import files
+from python.extensions.system_prompt._10_system_prompt import (
+    get_tools_prompt,
+)
+
 
 class Unknown(Tool):
-    def execute(self, **kwargs):
+    async def execute(self, **kwargs):
+        tools = get_tools_prompt(self.agent)
         return Response(
-                message=files.read_file("prompts/fw.tool_not_found.md",
-                                        tool_name=self.name,
-                                        tools_prompt=files.read_file("prompts/agent.tools.md")), 
-                break_loop=False)
-
+            message=self.agent.read_prompt(
+                "fw.tool_not_found.md", tool_name=self.name, tools_prompt=tools
+            ),
+            break_loop=False,
+        )

@@ -9,7 +9,7 @@ class LocalInteractiveSession:
         self.process = None
         self.full_output = ''
 
-    def connect(self):
+    async def connect(self):
         # Start a new subprocess with the appropriate shell for the OS
         if sys.platform.startswith('win'):
             # Windows
@@ -44,12 +44,16 @@ class LocalInteractiveSession:
         self.process.stdin.write(command + '\n') # type: ignore
         self.process.stdin.flush() # type: ignore
  
-    def read_output(self) -> Tuple[str, Optional[str]]:
+    async def read_output(self, timeout: float = 0, reset_full_output: bool = False) -> Tuple[str, Optional[str]]:
         if not self.process:
             raise Exception("Shell not connected")
 
+        if reset_full_output:
+            self.full_output = ""
         partial_output = ''
-        while True:
+        start_time = time.time()
+        
+        while (timeout <= 0 or time.time() - start_time < timeout):
             rlist, _, _ = select.select([self.process.stdout], [], [], 0.1)
             if rlist:
                 line = self.process.stdout.readline()  # type: ignore

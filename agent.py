@@ -1,298 +1,679 @@
+import asyncio
+from collections import OrderedDict
 from dataclasses import dataclass, field
 import time, importlib, inspect, os, json
-from typing import Any, Optional, Dict
-from python.helpers import extract_tools, rate_limiter, files, errors
+import token
+from typing import Any, Awaitable, Coroutine, Optional, Dict, TypedDict
+import uuid
+import models
+
+from langchain_core.prompt_values import ChatPromptValue
+from python.helpers import extract_tools, rate_limiter, files, errors, history, tokens
 from python.helpers.print_style import PrintStyle
-from langchain.schema import AIMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.language_models.llms import BaseLLM
 from langchain_core.embeddings import Embeddings
+import python.helpers.log as Log
+from python.helpers.dirty_json import DirtyJson
+from python.helpers.defer import DeferredTask
+from typing import Callable
+
+
+class AgentContext:
+
+    _contexts: dict[str, "AgentContext"] = {}
+    _counter: int = 0
+
+    def __init__(
+        self,
+        config: "AgentConfig",
+        id: str | None = None,
+        name: str | None = None,
+        agent0: "Agent|None" = None,
+        log: Log.Log | None = None,
+        paused: bool = False,
+        streaming_agent: "Agent|None" = None,
+    ):
+        # build context
+        self.id = id or str(uuid.uuid4())
+        self.name = name
+        self.config = config
+        self.log = log or Log.Log()
+        self.agent0 = agent0 or Agent(0, self.config, self)
+        self.paused = paused
+        self.streaming_agent = streaming_agent
+        self.task: DeferredTask | None = None
+        AgentContext._counter += 1
+        self.no = AgentContext._counter
+
+        existing = self._contexts.get(self.id, None)
+        if existing:
+            AgentContext.remove(self.id)
+        self._contexts[self.id] = self
+
+    @staticmethod
+    def get(id: str):
+        return AgentContext._contexts.get(id, None)
+
+    @staticmethod
+    def first():
+        if not AgentContext._contexts:
+            return None
+        return list(AgentContext._contexts.values())[0]
+
+    @staticmethod
+    def remove(id: str):
+        context = AgentContext._contexts.pop(id, None)
+        if context and context.task:
+            context.task.kill()
+        return context
+
+    def kill_process(self):
+        if self.task:
+            self.task.kill()
+
+    def reset(self):
+        self.kill_process()
+        self.log.reset()
+        self.agent0 = Agent(0, self.config, self)
+        self.streaming_agent = None
+        self.paused = False
+
+    def nudge(self):
+        self.kill_process()
+        self.paused = False
+        if self.streaming_agent:
+            current_agent = self.streaming_agent
+        else:
+            current_agent = self.agent0
+
+        self.task =self.run_task(current_agent.monologue)
+        return self.task
+
+    def communicate(self, msg: "UserMessage", broadcast_level: int = 1):
+        self.paused = False  # unpause if paused
+
+        if self.streaming_agent:
+            current_agent = self.streaming_agent
+        else:
+            current_agent = self.agent0
+
+        if self.task and self.task.is_alive():
+            # set intervention messages to agent(s):
+            intervention_agent = current_agent
+            while intervention_agent and broadcast_level != 0:
+                intervention_agent.intervention = msg
+                broadcast_level -= 1
+                intervention_agent = intervention_agent.data.get(
+                    Agent.DATA_NAME_SUPERIOR, None
+                )
+        else:
+            self.task = self.run_task(self._process_chain, current_agent, msg)
+
+        return self.task
+
+    def run_task(
+        self, func: Callable[..., Coroutine[Any, Any, Any]], *args: Any, **kwargs: Any
+    ):
+        if not self.task:
+            self.task = DeferredTask(
+                thread_name=self.__class__.__name__,
+            )
+        self.task.start_task(func, *args, **kwargs)
+        return self.task
+
+    # this wrapper ensures that superior agents are called back if the chat was loaded from file and original callstack is gone
+    async def _process_chain(self, agent: "Agent", msg: "UserMessage|str", user=True):
+        try:
+            msg_template = (
+                await agent.hist_add_user_message(msg)  # type: ignore
+                if user
+                else await agent.hist_add_tool_result(
+                    tool_name="call_subordinate", tool_result=msg  # type: ignore
+                )
+            )
+            response = await agent.monologue()
+            superior = agent.data.get(Agent.DATA_NAME_SUPERIOR, None)
+            if superior:
+                response = await self._process_chain(superior, response, False)
+            return response
+        except Exception as e:
+            agent.handle_critical_exception(e)
+
 
 @dataclass
-class AgentConfig: 
-    chat_model: BaseChatModel | BaseLLM
-    utility_model: BaseChatModel | BaseLLM
-    embeddings_model:Embeddings
+class ModelConfig:
+    provider: models.ModelProvider
+    name: str
+    ctx_length: int = 0
+    limit_requests: int = 0
+    limit_input: int = 0
+    limit_output: int = 0
+    vision: bool = False
+    kwargs: dict = field(default_factory=dict)
+
+
+@dataclass
+class AgentConfig:
+    chat_model: ModelConfig
+    utility_model: ModelConfig
+    embeddings_model: ModelConfig
+    browser_model: ModelConfig
+    prompts_subdir: str = ""
     memory_subdir: str = ""
-    auto_memory_count: int = 3
-    auto_memory_skip: int = 2
-    rate_limit_seconds: int = 60
-    rate_limit_requests: int = 15
-    rate_limit_input_tokens: int = 1000000
-    rate_limit_output_tokens: int = 0
-    msgs_keep_max: int = 25
-    msgs_keep_start: int = 5
-    msgs_keep_end: int = 10
-    response_timeout_seconds: int = 60
-    max_tool_response_length: int = 3000
-    code_exec_docker_enabled: bool = True
-    code_exec_docker_name: str = "agent-zero-exe"
-    code_exec_docker_image: str = "frdel/agent-zero-exe:latest"
-    code_exec_docker_ports: dict[str,int] = field(default_factory=lambda: {"22/tcp": 50022})
-    code_exec_docker_volumes: dict[str, dict[str, str]] = field(default_factory=lambda: {files.get_abs_path("work_dir"): {"bind": "/root", "mode": "rw"}})
+    knowledge_subdirs: list[str] = field(default_factory=lambda: ["default", "custom"])
+    code_exec_docker_enabled: bool = False
+    code_exec_docker_name: str = "A0-dev"
+    code_exec_docker_image: str = "frdel/agent-zero-run:development"
+    code_exec_docker_ports: dict[str, int] = field(
+        default_factory=lambda: {"22/tcp": 55022, "80/tcp": 55080}
+    )
+    code_exec_docker_volumes: dict[str, dict[str, str]] = field(
+        default_factory=lambda: {
+            files.get_base_dir(): {"bind": "/a0", "mode": "rw"},
+            files.get_abs_path("work_dir"): {"bind": "/root", "mode": "rw"},
+        }
+    )
     code_exec_ssh_enabled: bool = True
     code_exec_ssh_addr: str = "localhost"
-    code_exec_ssh_port: int = 50022
+    code_exec_ssh_port: int = 55022
     code_exec_ssh_user: str = "root"
-    code_exec_ssh_pass: str = "toor"
+    code_exec_ssh_pass: str = ""
     additional: Dict[str, Any] = field(default_factory=dict)
-    
+
+
+@dataclass
+class UserMessage:
+    message: str
+    attachments: list[str]
+
+
+class LoopData:
+    def __init__(self, **kwargs):
+        self.iteration = -1
+        self.system = []
+        self.user_message: history.Message | None = None
+        self.history_output: list[history.OutputMessage] = []
+        self.extras_temporary: OrderedDict[str, history.MessageContent] = OrderedDict()
+        self.extras_persistent: OrderedDict[str, history.MessageContent] = OrderedDict()
+        self.last_response = ""
+
+        # override values with kwargs
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
+
+# intervention exception class - skips rest of message loop iteration
+class InterventionException(Exception):
+    pass
+
+
+# killer exception class - not forwarded to LLM, cannot be fixed on its own, ends message loop
+class RepairableException(Exception):
+    pass
+
+
+class HandledException(Exception):
+    pass
+
 
 class Agent:
 
-    paused=False
-    streaming_agent=None
-    
-    def __init__(self, number:int, config: AgentConfig):
+    DATA_NAME_SUPERIOR = "_superior"
+    DATA_NAME_SUBORDINATE = "_subordinate"
+    DATA_NAME_CTX_WINDOW = "ctx_window"
 
-        # agent config  
-        self.config = config       
+    def __init__(
+        self, number: int, config: AgentConfig, context: AgentContext | None = None
+    ):
+
+        # agent config
+        self.config = config
+
+        # agent context
+        self.context = context or AgentContext(config)
 
         # non-config vars
         self.number = number
         self.agent_name = f"Agent {self.number}"
 
-        self.system_prompt = files.read_file("./prompts/agent.system.md", agent_name=self.agent_name)
-        self.tools_prompt = files.read_file("./prompts/agent.tools.md")
+        self.history = history.History(self)
+        self.last_user_message: history.Message | None = None
+        self.intervention: UserMessage | None = None
+        self.data = {}  # free data object all the tools can use
 
-        self.history = []
-        self.last_message = ""
-        self.intervention_message = ""
-        self.intervention_status = False
-        self.rate_limiter = rate_limiter.RateLimiter(max_calls=self.config.rate_limit_requests,max_input_tokens=self.config.rate_limit_input_tokens,max_output_tokens=self.config.rate_limit_output_tokens,window_seconds=self.config.rate_limit_seconds)
-        self.data = {} # free data object all the tools can use
+    async def monologue(self):
+        while True:
+            try:
+                # loop data dictionary to pass to extensions
+                self.loop_data = LoopData(user_message=self.last_user_message)
+                # call monologue_start extensions
+                await self.call_extensions("monologue_start", loop_data=self.loop_data)
 
-        os.chdir(files.get_abs_path("./work_dir")) #change CWD to work_dir
-        
+                printer = PrintStyle(italic=True, font_color="#b3ffd9", padding=False)
 
-    def message_loop(self, msg: str):
-        try:
-            printer = PrintStyle(italic=True, font_color="#b3ffd9", padding=False)    
-            user_message = files.read_file("./prompts/fw.user_message.md", message=msg)
-            self.append_message(user_message, human=True) # Append the user's input to the history                        
-            memories = self.fetch_memories(True)
-                
-            while True: # let the agent iterate on his thoughts until he stops by using a tool
-                Agent.streaming_agent = self #mark self as current streamer
-                agent_response = ""
-                self.intervention_status = False # reset interventon status
+                # let the agent run message loop until he stops it with a response tool
+                while True:
 
-                try:
+                    self.context.streaming_agent = self  # mark self as current streamer
+                    self.loop_data.iteration += 1
 
-                    system = self.system_prompt + "\n\n" + self.tools_prompt
-                    memories = self.fetch_memories()
-                    if memories: system+= "\n\n"+memories
+                    try:
+                        # prepare LLM chain (model, system, history)
+                        prompt = await self.prepare_prompt(loop_data=self.loop_data)
 
-                    prompt = ChatPromptTemplate.from_messages([
-                        SystemMessage(content=system),
-                        MessagesPlaceholder(variable_name="messages") ])
-                    
-                    inputs = {"messages": self.history}
-                    chain = prompt | self.config.chat_model
+                        # output that the agent is starting
+                        PrintStyle(
+                            bold=True,
+                            font_color="green",
+                            padding=True,
+                            background_color="white",
+                        ).print(f"{self.agent_name}: Generating")
+                        log = self.context.log.log(
+                            type="agent", heading=f"{self.agent_name}: Generating"
+                        )
 
-                    formatted_inputs = prompt.format(messages=self.history)
-                    tokens = int(len(formatted_inputs)/4)     
-                    self.rate_limiter.limit_call_and_input(tokens)
-                    
-                    # output that the agent is starting
-                    PrintStyle(bold=True, font_color="green", padding=True, background_color="white").print(f"{self.agent_name}: Starting a message:")
-                                            
-                    for chunk in chain.stream(inputs):
-                        if self.handle_intervention(agent_response): break # wait for intervention and handle it, if paused
+                        async def stream_callback(chunk: str, full: str):
+                            # output the agent response stream
+                            if chunk:
+                                printer.stream(chunk)
+                                self.log_from_stream(full, log)
 
-                        if isinstance(chunk, str): content = chunk
-                        elif hasattr(chunk, "content"): content = str(chunk.content)
-                        else: content = str(chunk)
-                        
-                        if content:
-                            printer.stream(content) # output the agent response stream                
-                            agent_response += content # concatenate stream into the response
+                        # store as last context window content
+                        self.set_data(Agent.DATA_NAME_CTX_WINDOW, prompt.format())
 
-                    self.rate_limiter.set_output_tokens(int(len(agent_response)/4))
-                    
-                    if not self.handle_intervention(agent_response):
-                        if self.last_message == agent_response: #if assistant_response is the same as last message in history, let him know
-                            self.append_message(agent_response) # Append the assistant's response to the history
-                            warning_msg = files.read_file("./prompts/fw.msg_repeat.md")
-                            self.append_message(warning_msg, human=True) # Append warning message to the history
-                            PrintStyle(font_color="orange", padding=True).print(warning_msg)
+                        agent_response = await self.call_chat_model(
+                            prompt, callback=stream_callback
+                        )
 
-                        else: #otherwise proceed with tool
-                            self.append_message(agent_response) # Append the assistant's response to the history
-                            tools_result = self.process_tools(agent_response) # process tools requested in agent message
-                            if tools_result: return tools_result #break the execution if the task is done
+                        await self.handle_intervention(agent_response)
 
-                # Forward errors to the LLM, maybe he can fix them
-                except Exception as e:
-                    error_message = errors.format_error(e)
-                    msg_response = files.read_file("./prompts/fw.error.md", error=error_message) # error message template
-                    self.append_message(msg_response, human=True)
-                    PrintStyle(font_color="red", padding=True).print(msg_response)
-                    
-        finally:
-            Agent.streaming_agent = None # unset current streamer
+                        if (
+                            self.loop_data.last_response == agent_response
+                        ):  # if assistant_response is the same as last message in history, let him know
+                            # Append the assistant's response to the history
+                            await self.hist_add_ai_response(agent_response)
+                            # Append warning message to the history
+                            warning_msg = self.read_prompt("fw.msg_repeat.md")
+                            await self.hist_add_warning(message=warning_msg)
+                            PrintStyle(font_color="orange", padding=True).print(
+                                warning_msg
+                            )
+                            self.context.log.log(type="warning", content=warning_msg)
 
-    def get_data(self, field:str):
+                        else:  # otherwise proceed with tool
+                            # Append the assistant's response to the history
+                            await self.hist_add_ai_response(agent_response)
+                            # process tools requested in agent message
+                            tools_result = await self.process_tools(agent_response)
+                            if tools_result:  # final response of message loop available
+                                return tools_result  # break the execution if the task is done
+
+                    # exceptions inside message loop:
+                    except InterventionException as e:
+                        pass  # intervention message has been handled in handle_intervention(), proceed with conversation loop
+                    except RepairableException as e:
+                        # Forward repairable errors to the LLM, maybe it can fix them
+                        error_message = errors.format_error(e)
+                        await self.hist_add_warning(error_message)
+                        PrintStyle(font_color="red", padding=True).print(error_message)
+                        self.context.log.log(type="error", content=error_message)
+                    except Exception as e:
+                        # Other exception kill the loop
+                        self.handle_critical_exception(e)
+
+                    finally:
+                        # call message_loop_end extensions
+                        await self.call_extensions(
+                            "message_loop_end", loop_data=self.loop_data
+                        )
+
+            # exceptions outside message loop:
+            except InterventionException as e:
+                pass  # just start over
+            except Exception as e:
+                self.handle_critical_exception(e)
+            finally:
+                self.context.streaming_agent = None  # unset current streamer
+                # call monologue_end extensions
+                await self.call_extensions("monologue_end", loop_data=self.loop_data)  # type: ignore
+
+    async def prepare_prompt(self, loop_data: LoopData) -> ChatPromptTemplate:
+        # set system prompt and message history
+        loop_data.system = await self.get_system_prompt(self.loop_data)
+        loop_data.history_output = self.history.output()
+
+        # and allow extensions to edit them
+        await self.call_extensions("message_loop_prompts", loop_data=loop_data)
+
+        # extras (memory etc.)
+        extras: list[history.OutputMessage] = []
+        for extra in loop_data.extras_persistent.values():
+            extras += history.Message(False, content=extra).output()
+        for extra in loop_data.extras_temporary.values():
+            extras += history.Message(False, content=extra).output()
+        loop_data.extras_temporary.clear()
+
+        # combine history and extras
+        history_combined = history.group_outputs_abab(loop_data.history_output + extras)
+
+        # convert history to LLM format
+        history_langchain = history.output_langchain(history_combined)
+
+        # build chain from system prompt, message history and model
+        prompt = ChatPromptTemplate.from_messages(
+            [
+                SystemMessage(content="\n\n".join(loop_data.system)),
+                *history_langchain,
+            ]
+        )
+        return prompt
+
+    def handle_critical_exception(self, exception: Exception):
+        if isinstance(exception, HandledException):
+            raise exception  # Re-raise the exception to kill the loop
+        elif isinstance(exception, asyncio.CancelledError):
+            # Handling for asyncio.CancelledError
+            PrintStyle(font_color="white", background_color="red", padding=True).print(
+                f"Context {self.context.id} terminated during message loop"
+            )
+            raise HandledException(
+                exception
+            )  # Re-raise the exception to cancel the loop
+        else:
+            # Handling for general exceptions
+            error_text = errors.error_text(exception)
+            error_message = errors.format_error(exception)
+            PrintStyle(font_color="red", padding=True).print(error_message)
+            self.context.log.log(
+                type="error",
+                heading="Error",
+                content=error_message,
+                kvps={"text": error_text},
+            )
+            raise HandledException(exception)  # Re-raise the exception to kill the loop
+
+    async def get_system_prompt(self, loop_data: LoopData) -> list[str]:
+        system_prompt = []
+        await self.call_extensions(
+            "system_prompt", system_prompt=system_prompt, loop_data=loop_data
+        )
+        return system_prompt
+
+    def parse_prompt(self, file: str, **kwargs):
+        prompt_dir = files.get_abs_path("prompts/default")
+        backup_dir = []
+        if (
+            self.config.prompts_subdir
+        ):  # if agent has custom folder, use it and use default as backup
+            prompt_dir = files.get_abs_path("prompts", self.config.prompts_subdir)
+            backup_dir.append(files.get_abs_path("prompts/default"))
+        prompt = files.parse_file(
+            files.get_abs_path(prompt_dir, file), _backup_dirs=backup_dir, **kwargs
+        )
+        return prompt
+
+    def read_prompt(self, file: str, **kwargs) -> str:
+        prompt_dir = files.get_abs_path("prompts/default")
+        backup_dir = []
+        if (
+            self.config.prompts_subdir
+        ):  # if agent has custom folder, use it and use default as backup
+            prompt_dir = files.get_abs_path("prompts", self.config.prompts_subdir)
+            backup_dir.append(files.get_abs_path("prompts/default"))
+        prompt = files.read_file(
+            files.get_abs_path(prompt_dir, file), _backup_dirs=backup_dir, **kwargs
+        )
+        prompt = files.remove_code_fences(prompt)
+        return prompt
+
+    def get_data(self, field: str):
         return self.data.get(field, None)
 
-    def set_data(self, field:str, value):
+    def set_data(self, field: str, value):
         self.data[field] = value
 
-    def append_message(self, msg: str, human: bool = False):
-        message_type = "human" if human else "ai"
-        if self.history and self.history[-1].type == message_type:
-            self.history[-1].content += "\n\n" + msg
+    def hist_add_message(self, ai: bool, content: history.MessageContent):
+        return self.history.add_message(ai=ai, content=content)
+
+    async def hist_add_user_message(
+        self, message: UserMessage, intervention: bool = False
+    ):
+        self.history.new_topic()  # user message starts a new topic in history
+
+        # load message template based on intervention
+        if intervention:
+            content = self.parse_prompt(
+                "fw.intervention.md",
+                message=message.message,
+                attachments=message.attachments,
+            )
         else:
-            new_message = HumanMessage(content=msg) if human else AIMessage(content=msg)
-            self.history.append(new_message)
-            self.cleanup_history(self.config.msgs_keep_max, self.config.msgs_keep_start, self.config.msgs_keep_end)
-        if message_type=="ai":
-            self.last_message = msg
+            content = self.parse_prompt(
+                "fw.user_message.md",
+                message=message.message,
+                attachments=message.attachments,
+            )
 
-    def concat_messages(self,messages):
-        return "\n".join([f"{msg.type}: {msg.content}" for msg in messages])
+        # remove empty attachments from template
+        if (
+            isinstance(content, dict)
+            and "attachments" in content
+            and not content["attachments"]
+        ):
+            del content["attachments"]
 
-    def send_adhoc_message(self, system: str, msg: str, output_label:str):
-        prompt = ChatPromptTemplate.from_messages([
-            SystemMessage(content=system),
-            HumanMessage(content=msg)])
+        # add to history
+        msg = self.hist_add_message(False, content=content)  # type: ignore
+        self.last_user_message = msg
+        return msg
 
-        chain = prompt | self.config.utility_model
+    async def hist_add_ai_response(self, message: str):
+        self.loop_data.last_response = message
+        content = self.parse_prompt("fw.ai_response.md", message=message)
+        return self.hist_add_message(True, content=content)
+
+    async def hist_add_warning(self, message: history.MessageContent):
+        content = self.parse_prompt("fw.warning.md", message=message)
+        return self.hist_add_message(False, content=content)
+
+    async def hist_add_tool_result(self, tool_name: str, tool_result: str):
+        content = self.parse_prompt(
+            "fw.tool_result.md", tool_name=tool_name, tool_result=tool_result
+        )
+        return self.hist_add_message(False, content=content)
+
+    def concat_messages(
+        self, messages
+    ):  # TODO add param for message range, topic, history
+        return self.history.output_text(human_label="user", ai_label="assistant")
+
+    def get_chat_model(self):
+        return models.get_model(
+            models.ModelType.CHAT,
+            self.config.chat_model.provider,
+            self.config.chat_model.name,
+            **self.config.chat_model.kwargs,
+        )
+
+    def get_utility_model(self):
+        return models.get_model(
+            models.ModelType.CHAT,
+            self.config.utility_model.provider,
+            self.config.utility_model.name,
+            **self.config.utility_model.kwargs,
+        )
+
+    def get_embedding_model(self):
+        return models.get_model(
+            models.ModelType.EMBEDDING,
+            self.config.embeddings_model.provider,
+            self.config.embeddings_model.name,
+            **self.config.embeddings_model.kwargs,
+        )
+
+    async def call_utility_model(
+        self,
+        system: str,
+        message: str,
+        callback: Callable[[str], Awaitable[None]] | None = None,
+        background: bool = False,
+    ):
+        prompt = ChatPromptTemplate.from_messages(
+            [SystemMessage(content=system), HumanMessage(content=message)]
+        )
+
         response = ""
-        printer = None
 
-        if output_label:
-            PrintStyle(bold=True, font_color="orange", padding=True, background_color="white").print(f"{self.agent_name}: {output_label}:")
-            printer = PrintStyle(italic=True, font_color="orange", padding=False)                
+        # model class
+        model = self.get_utility_model()
 
-        formatted_inputs = prompt.format()
-        tokens = int(len(formatted_inputs)/4)     
-        self.rate_limiter.limit_call_and_input(tokens)
-    
-        for chunk in chain.stream({}):
-            if self.handle_intervention(): break # wait for intervention and handle it, if paused
+        # rate limiter
+        limiter = await self.rate_limiter(
+            self.config.utility_model, prompt.format(), background
+        )
 
-            if isinstance(chunk, str): content = chunk
-            elif hasattr(chunk, "content"): content = str(chunk.content)
-            else: content = str(chunk)
+        async for chunk in (prompt | model).astream({}):
+            await self.handle_intervention()  # wait for intervention and handle it, if paused
 
-            if printer: printer.stream(content)
-            response+=content
+            content = models.parse_chunk(chunk)
+            limiter.add(output=tokens.approximate_tokens(content))
+            response += content
 
-        self.rate_limiter.set_output_tokens(int(len(response)/4))
+            if callback:
+                await callback(content)
 
         return response
-            
-    def get_last_message(self):
-        if self.history:
-            return self.history[-1]
 
-    def replace_middle_messages(self,middle_messages):
-        cleanup_prompt = files.read_file("./prompts/fw.msg_cleanup.md")
-        summary = self.send_adhoc_message(system=cleanup_prompt,msg=self.concat_messages(middle_messages), output_label="Mid messages cleanup summary")
-        new_human_message = HumanMessage(content=summary)
-        return [new_human_message]
+    async def call_chat_model(
+        self,
+        prompt: ChatPromptTemplate,
+        callback: Callable[[str, str], Awaitable[None]] | None = None,
+    ):
+        response = ""
 
-    def cleanup_history(self, max:int, keep_start:int, keep_end:int):
-        if len(self.history) <= max:
-            return self.history
+        # model class
+        model = self.get_chat_model()
 
-        first_x = self.history[:keep_start]
-        last_y = self.history[-keep_end:]
+        # rate limiter
+        limiter = await self.rate_limiter(self.config.chat_model, prompt.format())
 
-        # Identify the middle part
-        middle_part = self.history[keep_start:-keep_end]
+        async for chunk in (prompt | model).astream({}):
+            await self.handle_intervention()  # wait for intervention and handle it, if paused
 
-        # Ensure the first message in the middle is "human", if not, move one message back
-        if middle_part and middle_part[0].type != "human":
-            if len(first_x) > 0:
-                middle_part.insert(0, first_x.pop())
+            content = models.parse_chunk(chunk)
+            limiter.add(output=tokens.approximate_tokens(content))
+            response += content
 
-        # Ensure the middle part has an odd number of messages
-        if len(middle_part) % 2 == 0:
-            middle_part = middle_part[:-1]
+            if callback:
+                await callback(content, response)
 
-        # Replace the middle part using the replacement function
-        new_middle_part = self.replace_middle_messages(middle_part)
+        return response
 
-        self.history = first_x + new_middle_part + last_y
+    async def rate_limiter(
+        self, model_config: ModelConfig, input: str, background: bool = False
+    ):
+        # rate limiter log
+        wait_log = None
 
-        return self.history
+        async def wait_callback(msg: str, key: str, total: int, limit: int):
+            nonlocal wait_log
+            if not wait_log:
+                wait_log = self.context.log.log(
+                    type="util",
+                    update_progress="none",
+                    heading=msg,
+                    model=f"{model_config.provider.value}\\{model_config.name}",
+                )
+            wait_log.update(heading=msg, key=key, value=total, limit=limit)
+            if not background:
+                self.context.log.set_progress(msg, -1)
 
-    def handle_intervention(self, progress:str="") -> bool:
-        while self.paused: time.sleep(0.1) # wait if paused
-        if self.intervention_message and not self.intervention_status: # if there is an intervention message, but not yet processed
-            if progress.strip(): self.append_message(progress) # append the response generated so far
-            user_msg = files.read_file("./prompts/fw.intervention.md", user_message=self.intervention_message) # format the user intervention template
-            self.append_message(user_msg,human=True) # append the intervention message
-            self.intervention_message = "" # reset the intervention message
-            self.intervention_status = True
-        return self.intervention_status # return intervention status
+        # rate limiter
+        limiter = models.get_rate_limiter(
+            model_config.provider,
+            model_config.name,
+            model_config.limit_requests,
+            model_config.limit_input,
+            model_config.limit_output,
+        )
+        limiter.add(input=tokens.approximate_tokens(input))
+        limiter.add(requests=1)
+        await limiter.wait(callback=wait_callback)
+        return limiter
 
-    def process_tools(self, msg: str):
+    async def handle_intervention(self, progress: str = ""):
+        while self.context.paused:
+            await asyncio.sleep(0.1)  # wait if paused
+        if (
+            self.intervention
+        ):  # if there is an intervention message, but not yet processed
+            msg = self.intervention
+            self.intervention = None  # reset the intervention message
+            if progress.strip():
+                await self.hist_add_ai_response(progress)
+            # append the intervention message
+            await self.hist_add_user_message(msg, intervention=True)
+            raise InterventionException(msg)
+
+    async def wait_if_paused(self):
+        while self.context.paused:
+            await asyncio.sleep(0.1)
+
+    async def process_tools(self, msg: str):
         # search for tool usage requests in agent message
         tool_request = extract_tools.json_parse_dirty(msg)
 
         if tool_request is not None:
             tool_name = tool_request.get("tool_name", "")
             tool_args = tool_request.get("tool_args", {})
+            tool = self.get_tool(tool_name, tool_args, msg)
 
-            tool = self.get_tool(
-                        tool_name,
-                        tool_args,
-                        msg)
-                
-            if self.handle_intervention(): return # wait if paused and handle intervention message if needed
-            tool.before_execution(**tool_args)
-            if self.handle_intervention(): return # wait if paused and handle intervention message if needed
-            response = tool.execute(**tool_args)
-            if self.handle_intervention(): return # wait if paused and handle intervention message if needed
-            tool.after_execution(response)
-            if self.handle_intervention(): return # wait if paused and handle intervention message if needed
-            if response.break_loop: return response.message
+            await self.handle_intervention()  # wait if paused and handle intervention message if needed
+            await tool.before_execution(**tool_args)
+            await self.handle_intervention()  # wait if paused and handle intervention message if needed
+            response = await tool.execute(**tool_args)
+            await self.handle_intervention()  # wait if paused and handle intervention message if needed
+            await tool.after_execution(response)
+            await self.handle_intervention()  # wait if paused and handle intervention message if needed
+            if response.break_loop:
+                return response.message
         else:
-            msg = files.read_file("prompts/fw.msg_misformat.md")
-            self.append_message(msg, human=True)
+            msg = self.read_prompt("fw.msg_misformat.md")
+            await self.hist_add_warning(msg)
             PrintStyle(font_color="red", padding=True).print(msg)
+            self.context.log.log(
+                type="error", content=f"{self.agent_name}: Message misformat"
+            )
 
+    def log_from_stream(self, stream: str, logItem: Log.LogItem):
+        try:
+            if len(stream) < 25:
+                return  # no reason to try
+            response = DirtyJson.parse_string(stream)
+            if isinstance(response, dict):
+                # log if result is a dictionary already
+                logItem.update(content=stream, kvps=response)
+        except Exception as e:
+            pass
 
     def get_tool(self, name: str, args: dict, message: str, **kwargs):
-        from python.tools.unknown import Unknown 
+        from python.tools.unknown import Unknown
         from python.helpers.tool import Tool
-        
-        tool_class = Unknown
-        if files.exists("python/tools",f"{name}.py"): 
-            module = importlib.import_module("python.tools." + name)  # Import the module
-            class_list = inspect.getmembers(module, inspect.isclass)  # Get all functions in the module
 
-            for cls in class_list:
-                if cls[1] is not Tool and issubclass(cls[1], Tool):
-                    tool_class = cls[1]
-                    break
-
+        classes = extract_tools.load_classes_from_folder(
+            "python/tools", name + ".py", Tool
+        )
+        tool_class = classes[0] if classes else Unknown
         return tool_class(agent=self, name=name, args=args, message=message, **kwargs)
 
-    def fetch_memories(self,reset_skip=False):
-        if self.config.auto_memory_count<=0: return ""
-        if reset_skip: self.memory_skip_counter = 0
+    async def call_extensions(self, folder: str, **kwargs) -> Any:
+        from python.helpers.extension import Extension
 
-        if self.memory_skip_counter > 0:
-            self.memory_skip_counter-=1
-            return ""
-        else:
-            self.memory_skip_counter = self.config.auto_memory_skip
-            from python.tools import memory_tool
-            messages = self.concat_messages(self.history)
-            memories = memory_tool.search(self,messages)
-            input = {
-                "conversation_history" : messages,
-                "raw_memories": memories
-            }
-            cleanup_prompt = files.read_file("./prompts/msg.memory_cleanup.md").replace("{", "{{")       
-            clean_memories = self.send_adhoc_message(cleanup_prompt,json.dumps(input), output_label="Memory injection")
-            return clean_memories
-
-    def call_extension(self, name: str, **kwargs) -> Any:
-        pass
+        classes = extract_tools.load_classes_from_folder(
+            "python/extensions/" + folder, "*", Extension
+        )
+        for cls in classes:
+            await cls(agent=self).execute(**kwargs)
