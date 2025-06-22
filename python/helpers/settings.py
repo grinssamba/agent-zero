@@ -1,4 +1,5 @@
-import asyncio
+import base64
+import hashlib
 import json
 import os
 import re
@@ -8,6 +9,7 @@ from typing import Any, Literal, TypedDict
 import models
 from python.helpers import runtime, whisper, defer
 from . import files, dotenv
+from python.helpers.print_style import PrintStyle
 
 
 class Settings(TypedDict):
@@ -16,6 +18,7 @@ class Settings(TypedDict):
     chat_model_kwargs: dict[str, str]
     chat_model_ctx_length: int
     chat_model_ctx_history: float
+    chat_model_vision: bool
     chat_model_rl_requests: int
     chat_model_rl_input: int
     chat_model_rl_output: int
@@ -62,6 +65,12 @@ class Settings(TypedDict):
     stt_silence_duration: int
     stt_waiting_timeout: int
 
+    mcp_servers: str
+    mcp_client_init_timeout: int
+    mcp_client_tool_timeout: int
+    mcp_server_enabled: bool
+    mcp_server_token: str
+
 
 class PartialSettings(Settings, total=False):
     pass
@@ -76,11 +85,14 @@ class SettingsField(TypedDict, total=False):
     id: str
     title: str
     description: str
-    type: Literal["text", "number", "select", "range", "textarea", "password", "switch"]
+    type: Literal[
+        "text", "number", "select", "range", "textarea", "password", "switch", "button"
+    ]
     value: Any
     min: float
     max: float
     step: float
+    hidden: bool
     options: list[FieldOption]
 
 
@@ -89,6 +101,7 @@ class SettingsSection(TypedDict, total=False):
     title: str
     description: str
     fields: list[SettingsField]
+    tab: str  # Indicates which tab this section belongs to
 
 
 class SettingsOutput(TypedDict):
@@ -151,6 +164,16 @@ def convert_out(settings: Settings) -> SettingsOutput:
 
     chat_model_fields.append(
         {
+            "id": "chat_model_vision",
+            "title": "Supports Vision",
+            "description": "Models capable of Vision can for example natively see the content of image attachments.",
+            "type": "switch",
+            "value": settings["chat_model_vision"],
+        }
+    )
+
+    chat_model_fields.append(
+        {
             "id": "chat_model_rl_requests",
             "title": "Requests per minute limit",
             "description": "Limits the number of requests per minute to the chat model. Waits if the limit is exceeded. Set to 0 to disable rate limiting.",
@@ -194,6 +217,7 @@ def convert_out(settings: Settings) -> SettingsOutput:
         "title": "Chat Model",
         "description": "Selection and settings for main chat model used by Agent Zero",
         "fields": chat_model_fields,
+        "tab": "agent",
     }
 
     # main model section
@@ -263,6 +287,7 @@ def convert_out(settings: Settings) -> SettingsOutput:
         "title": "Utility model",
         "description": "Smaller, cheaper, faster model for handling utility tasks like organizing memory, preparing prompts, summarizing.",
         "fields": util_model_fields,
+        "tab": "agent",
     }
 
     # embedding model section
@@ -322,6 +347,7 @@ def convert_out(settings: Settings) -> SettingsOutput:
         "title": "Embedding Model",
         "description": "Settings for the embedding model used by Agent Zero.",
         "fields": embed_model_fields,
+        "tab": "agent",
     }
 
     # embedding model section
@@ -371,6 +397,7 @@ def convert_out(settings: Settings) -> SettingsOutput:
         "title": "Web Browser Model",
         "description": "Settings for the web browser model. Agent Zero uses <a href='https://github.com/browser-use/browser-use' target='_blank'>browser-use</a> agentic framework to handle web interactions.",
         "fields": browser_model_fields,
+        "tab": "agent",
     }
 
     # # Memory settings section
@@ -435,6 +462,7 @@ def convert_out(settings: Settings) -> SettingsOutput:
         "title": "Authentication",
         "description": "Settings for authentication to use Agent Zero Web UI.",
         "fields": auth_fields,
+        "tab": "external",
     }
 
     # api keys model section
@@ -443,20 +471,21 @@ def convert_out(settings: Settings) -> SettingsOutput:
     api_keys_fields.append(
         _get_api_key_field(settings, "anthropic", "Anthropic API Key")
     )
-    api_keys_fields.append(_get_api_key_field(settings, "groq", "Groq API Key"))
-    api_keys_fields.append(_get_api_key_field(settings, "google", "Google API Key"))
+    api_keys_fields.append(_get_api_key_field(settings, "chutes", "Chutes API Key"))
     api_keys_fields.append(_get_api_key_field(settings, "deepseek", "DeepSeek API Key"))
+    api_keys_fields.append(_get_api_key_field(settings, "google", "Google API Key"))
+    api_keys_fields.append(_get_api_key_field(settings, "groq", "Groq API Key"))
     api_keys_fields.append(
-        _get_api_key_field(settings, "openrouter", "OpenRouter API Key")
-    )
-    api_keys_fields.append(
-        _get_api_key_field(settings, "sambanova", "Sambanova API Key")
+        _get_api_key_field(settings, "huggingface", "HuggingFace API Key")
     )
     api_keys_fields.append(
         _get_api_key_field(settings, "mistralai", "MistralAI API Key")
     )
     api_keys_fields.append(
-        _get_api_key_field(settings, "huggingface", "HuggingFace API Key")
+        _get_api_key_field(settings, "openrouter", "OpenRouter API Key")
+    )
+    api_keys_fields.append(
+        _get_api_key_field(settings, "sambanova", "Sambanova API Key")
     )
 
     api_keys_section: SettingsSection = {
@@ -464,6 +493,7 @@ def convert_out(settings: Settings) -> SettingsOutput:
         "title": "API Keys",
         "description": "API keys for model providers and services used by Agent Zero.",
         "fields": api_keys_fields,
+        "tab": "external",
     }
 
     # Agent config section
@@ -516,6 +546,7 @@ def convert_out(settings: Settings) -> SettingsOutput:
         "title": "Agent Config",
         "description": "Agent parameters.",
         "fields": agent_fields,
+        "tab": "agent",
     }
 
     dev_fields: list[SettingsField] = []
@@ -581,6 +612,7 @@ def convert_out(settings: Settings) -> SettingsOutput:
         "title": "Development",
         "description": "Parameters for A0 framework development. RFCs (remote function calls) are used to call functions on another A0 instance. You can develop and debug A0 natively on your local system while redirecting some functions to A0 instance in docker. This is crucial for development as A0 needs to run in standardized environment to support all features.",
         "fields": dev_fields,
+        "tab": "developer",
     }
 
     # Speech to text section
@@ -652,6 +684,90 @@ def convert_out(settings: Settings) -> SettingsOutput:
         "title": "Speech to Text",
         "description": "Voice transcription preferences and server turn detection settings.",
         "fields": stt_fields,
+        "tab": "agent",
+    }
+
+    # MCP section
+    mcp_client_fields: list[SettingsField] = []
+
+    mcp_client_fields.append(
+        {
+            "id": "mcp_servers_config",
+            "title": "MCP Servers Configuration",
+            "description": "External MCP servers can be configured here.",
+            "type": "button",
+            "value": "Open",
+        }
+    )
+
+    mcp_client_fields.append(
+        {
+            "id": "mcp_servers",
+            "title": "MCP Servers",
+            "description": "(JSON list of) >> RemoteServer <<: [name, url, headers, timeout (opt), sse_read_timeout (opt), disabled (opt)] / >> Local Server <<: [name, command, args, env, encoding (opt), encoding_error_handler (opt), disabled (opt)]",
+            "type": "textarea",
+            "value": settings["mcp_servers"],
+            "hidden": True,
+        }
+    )
+
+    mcp_client_fields.append(
+        {
+            "id": "mcp_client_init_timeout",
+            "title": "MCP Client Init Timeout",
+            "description": "Timeout for MCP client initialization (in seconds). Higher values might be required for complex MCPs, but might also slowdown system startup.",
+            "type": "number",
+            "value": settings["mcp_client_init_timeout"],
+        }
+    )
+
+    mcp_client_fields.append(
+        {
+            "id": "mcp_client_tool_timeout",
+            "title": "MCP Client Tool Timeout",
+            "description": "Timeout for MCP client tool execution. Higher values might be required for complex tools, but might also result in long responses with failing tools.",
+            "type": "number",
+            "value": settings["mcp_client_tool_timeout"],
+        }
+    )
+
+    mcp_client_section: SettingsSection = {
+        "id": "mcp_client",
+        "title": "External MCP Servers",
+        "description": "Agent Zero can use external MCP servers, local or remote as tools.",
+        "fields": mcp_client_fields,
+        "tab": "mcp",
+    }
+
+    mcp_server_fields: list[SettingsField] = []
+
+    mcp_server_fields.append(
+        {
+            "id": "mcp_server_enabled",
+            "title": "Enable A0 MCP Server",
+            "description": "Expose Agent Zero as an SSE MCP server. This will make this A0 instance available to MCP clients.",
+            "type": "switch",
+            "value": settings["mcp_server_enabled"],
+        }
+    )
+
+    mcp_server_fields.append(
+        {
+            "id": "mcp_server_token",
+            "title": "MCP Server Token",
+            "description": "Token for MCP server authentication.",
+            "type": "text",
+            "hidden": True,
+            "value": settings["mcp_server_token"],
+        }
+    )
+
+    mcp_server_section: SettingsSection = {
+        "id": "mcp_server",
+        "title": "A0 MCP Server",
+        "description": "Agent Zero can be exposed as an SSE MCP server. See <a href=\"javascript:openModal('settings/mcp/server/example.html')\">connection example</a>.",
+        "fields": mcp_server_fields,
+        "tab": "mcp",
     }
 
     # Add the section to the result
@@ -666,6 +782,8 @@ def convert_out(settings: Settings) -> SettingsOutput:
             stt_section,
             api_keys_section,
             auth_section,
+            mcp_client_section,
+            mcp_server_section,
             dev_section,
         ]
     }
@@ -707,16 +825,31 @@ def get_settings() -> Settings:
     return norm
 
 
-def set_settings(settings: Settings):
+def set_settings(settings: Settings, apply: bool = True):
     global _settings
+    previous = _settings
     _settings = normalize_settings(settings)
     _write_settings_file(_settings)
-    _apply_settings()
+    if apply:
+        _apply_settings(previous)
+
+
+def set_settings_delta(delta: dict, apply: bool = True):
+    current = get_settings()
+    new = {**current, **delta}
+    set_settings(new, apply)  # type: ignore
 
 
 def normalize_settings(settings: Settings) -> Settings:
     copy = settings.copy()
     default = get_default_settings()
+
+    # remove keys that are not in default
+    keys_to_remove = [key for key in copy if key not in default]
+    for key in keys_to_remove:
+        del copy[key]
+
+    # add missing keys and normalize types
     for key, value in default.items():
         if key not in copy:
             copy[key] = value
@@ -725,6 +858,10 @@ def normalize_settings(settings: Settings) -> Settings:
                 copy[key] = type(value)(copy[key])  # type: ignore
             except (ValueError, TypeError):
                 copy[key] = value  # make default instead
+
+    # mcp server token is set automatically
+    copy["mcp_server_token"] = create_auth_token()
+
     return copy
 
 
@@ -750,6 +887,7 @@ def _remove_sensitive_settings(settings: Settings):
     settings["auth_password"] = ""
     settings["rfc_password"] = ""
     settings["root_password"] = ""
+    settings["mcp_server_token"] = ""
 
 
 def _write_sensitive_settings(settings: Settings):
@@ -773,30 +911,31 @@ def get_default_settings() -> Settings:
 
     return Settings(
         chat_model_provider=ModelProvider.OPENAI.name,
-        chat_model_name="gpt-4o",
-        chat_model_kwargs={ "temperature": "0" },
-        chat_model_ctx_length=120000,
+        chat_model_name="gpt-4.1",
+        chat_model_kwargs={"temperature": "0"},
+        chat_model_ctx_length=100000,
         chat_model_ctx_history=0.7,
+        chat_model_vision=True,
         chat_model_rl_requests=0,
         chat_model_rl_input=0,
         chat_model_rl_output=0,
         util_model_provider=ModelProvider.OPENAI.name,
-        util_model_name="gpt-4o-mini",
-        util_model_ctx_length=120000,
+        util_model_name="gpt-4.1-nano",
+        util_model_ctx_length=100000,
         util_model_ctx_input=0.7,
-        util_model_kwargs={ "temperature": "0" },
-        util_model_rl_requests=60,
+        util_model_kwargs={"temperature": "0"},
+        util_model_rl_requests=0,
         util_model_rl_input=0,
         util_model_rl_output=0,
-        embed_model_provider=ModelProvider.OPENAI.name,
-        embed_model_name="text-embedding-3-small",
+        embed_model_provider=ModelProvider.HUGGINGFACE.name,
+        embed_model_name="sentence-transformers/all-MiniLM-L6-v2",
         embed_model_kwargs={},
         embed_model_rl_requests=0,
         embed_model_rl_input=0,
         browser_model_provider=ModelProvider.OPENAI.name,
-        browser_model_name="gpt-4o",
-        browser_model_vision=False,
-        browser_model_kwargs={ "temperature": "0" },
+        browser_model_name="gpt-4.1",
+        browser_model_vision=True,
+        browser_model_kwargs={"temperature": "0"},
         api_keys={},
         auth_login="",
         auth_password="",
@@ -814,17 +953,23 @@ def get_default_settings() -> Settings:
         stt_silence_threshold=0.3,
         stt_silence_duration=1000,
         stt_waiting_timeout=2000,
+        mcp_servers='{\n    "mcpServers": {}\n}',
+        mcp_client_init_timeout=5,
+        mcp_client_tool_timeout=120,
+        mcp_server_enabled=False,
+        mcp_server_token=create_auth_token(),
     )
 
 
-def _apply_settings():
+def _apply_settings(previous: Settings | None):
     global _settings
     if _settings:
         from agent import AgentContext
-        from initialize import initialize
+        from initialize import initialize_agent
 
+        config = initialize_agent()
         for ctx in AgentContext._contexts.values():
-            ctx.config = initialize()  # reinitialize context config with new settings
+            ctx.config = config  # reinitialize context config with new settings
             # apply config to agents
             agent = ctx.agent0
             while agent:
@@ -832,9 +977,83 @@ def _apply_settings():
                 agent = agent.get_data(agent.DATA_NAME_SUBORDINATE)
 
         # reload whisper model if necessary
-        task = defer.DeferredTask().start_task(
-            whisper.preload, _settings["stt_model_size"]
-        )  # TODO overkill, replace with background task
+        if not previous or _settings["stt_model_size"] != previous["stt_model_size"]:
+            task = defer.DeferredTask().start_task(
+                whisper.preload, _settings["stt_model_size"]
+            )  # TODO overkill, replace with background task
+
+        # force memory reload on embedding model change
+        if not previous or (
+            _settings["embed_model_name"] != previous["embed_model_name"]
+            or _settings["embed_model_provider"] != previous["embed_model_provider"]
+            or _settings["embed_model_kwargs"] != previous["embed_model_kwargs"]
+        ):
+            from python.helpers.memory import reload as memory_reload
+
+            memory_reload()
+
+        # update mcp settings if necessary
+        if not previous or _settings["mcp_servers"] != previous["mcp_servers"]:
+            from python.helpers.mcp_handler import MCPConfig
+
+            async def update_mcp_settings(mcp_servers: str):
+                PrintStyle(
+                    background_color="black", font_color="white", padding=True
+                ).print("Updating MCP config...")
+                AgentContext.log_to_all(
+                    type="info", content="Updating MCP settings...", temp=True
+                )
+
+                mcp_config = MCPConfig.get_instance()
+                try:
+                    MCPConfig.update(mcp_servers)
+                except Exception as e:
+                    AgentContext.log_to_all(
+                        type="error",
+                        content=f"Failed to update MCP settings: {e}",
+                        temp=False,
+                    )
+                    (
+                        PrintStyle(
+                            background_color="red", font_color="black", padding=True
+                        ).print("Failed to update MCP settings")
+                    )
+                    (
+                        PrintStyle(
+                            background_color="black", font_color="red", padding=True
+                        ).print(f"{e}")
+                    )
+
+                PrintStyle(
+                    background_color="#6734C3", font_color="white", padding=True
+                ).print("Parsed MCP config:")
+                (
+                    PrintStyle(
+                        background_color="#334455", font_color="white", padding=False
+                    ).print(mcp_config.model_dump_json())
+                )
+                AgentContext.log_to_all(
+                    type="info", content="Finished updating MCP settings.", temp=True
+                )
+
+            task2 = defer.DeferredTask().start_task(
+                update_mcp_settings, config.mcp_servers
+            )  # TODO overkill, replace with background task
+
+        # update token in mcp server
+        current_token = create_auth_token() #TODO - ugly, token in settings is generated from dotenv and does not always correspond
+        if (
+            not previous
+            or current_token != previous["mcp_server_token"]
+        ):
+
+            async def update_mcp_token(token: str):
+                from python.helpers.mcp_server import DynamicMcpProxy
+                DynamicMcpProxy.get_instance().reconfigure(token=token)
+
+            task3 = defer.DeferredTask().start_task(
+                update_mcp_token, current_token
+            )  # TODO overkill, replace with background task
 
 
 def _env_to_dict(data: str):
@@ -890,3 +1109,15 @@ def get_runtime_config(set: Settings):
             "code_exec_http_port": set["rfc_port_http"],
             "code_exec_ssh_user": "root",
         }
+
+
+def create_auth_token() -> str:
+    username = dotenv.get_dotenv_value(dotenv.KEY_AUTH_LOGIN) or ""
+    password = dotenv.get_dotenv_value(dotenv.KEY_AUTH_PASSWORD) or ""
+    if not username or not password:
+        return "0"
+    # use base64 encoding for a more compact token with alphanumeric chars
+    hash_bytes = hashlib.sha256(f"{username}:{password}".encode()).digest()
+    # encode as base64 and remove any non-alphanumeric chars (like +, /, =)
+    b64_token = base64.urlsafe_b64encode(hash_bytes).decode().replace("=", "")
+    return b64_token[:16]
